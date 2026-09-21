@@ -13,13 +13,14 @@
 // ========= Copyright 2025-2026 @ Eigent.ai All Rights Reserved. =========
 
 import { Button } from '@/components/ui/button';
+import { DsText } from '@/components/ui/ds-text';
 import { Input } from '@/components/ui/input';
 import { LocaleEnum, switchLanguage } from '@/i18n';
 import { SITE_URL } from '@/lib';
 import { useAuthStore } from '@/store/authStore';
 import { useInstallationStore } from '@/store/installationStore';
 import { LogOut, Settings } from 'lucide-react';
-import { createRef, RefObject, useEffect, useState } from 'react';
+import { createRef, RefObject, useEffect, useId, useState } from 'react';
 import { Trans, useTranslation } from 'react-i18next';
 import { useNavigate } from 'react-router-dom';
 import { toast } from 'sonner';
@@ -67,9 +68,13 @@ export default function SettingGeneral({
 
   // Proxy configuration state
   const [proxyUrl, setProxyUrl] = useState('');
+  const [savedProxyUrl, setSavedProxyUrl] = useState('');
   const [proxyLoading, setProxyLoading] = useState(true);
   const [isProxySaving, setIsProxySaving] = useState(false);
   const [proxyNeedsRestart, setProxyNeedsRestart] = useState(false);
+  const proxyRestartHintId = useId();
+  const hasProxyValueChanged = proxyUrl !== savedProxyUrl;
+  const hasUnsavedProxyChanges = proxyUrl.trim() !== savedProxyUrl.trim();
 
   const languageList = [
     {
@@ -124,9 +129,9 @@ export default function SettingGeneral({
       try {
         if (host?.electronAPI?.readGlobalEnv) {
           const result = await host.electronAPI.readGlobalEnv('HTTP_PROXY');
-          if (result?.value) {
-            setProxyUrl(result.value);
-          }
+          const loadedProxyUrl = result?.value ?? '';
+          setProxyUrl(loadedProxyUrl);
+          setSavedProxyUrl(loadedProxyUrl);
         }
       } catch (_error) {
         console.log('No proxy configured');
@@ -139,6 +144,8 @@ export default function SettingGeneral({
 
   // Save proxy configuration
   const handleSaveProxy = async () => {
+    if (proxyLoading || isProxySaving || !hasUnsavedProxyChanges) return;
+
     if (!authStore.email) {
       toast.error(t('setting.proxy-save-failed'));
       return;
@@ -182,8 +189,16 @@ export default function SettingGeneral({
         );
         if (!result?.success) throw new Error('envRemove returned no success');
       }
+      setProxyUrl(trimmed);
+      setSavedProxyUrl(trimmed);
       setProxyNeedsRestart(true);
-      toast.success(t('setting.proxy-saved-restart-required'));
+      toast.success(
+        t(
+          trimmed
+            ? 'setting.proxy-saved-restart-required'
+            : 'setting.proxy-cleared-restart-required'
+        )
+      );
     } catch (error) {
       console.error('Failed to save proxy:', error);
       toast.error(t('setting.proxy-save-failed'));
@@ -295,45 +310,84 @@ export default function SettingGeneral({
             description={t('setting.network-proxy-description')}
             actionClassName="w-[280px]"
             action={
-              <Input
-                placeholder={t('setting.proxy-placeholder')}
-                value={proxyUrl}
-                onChange={(e) => {
-                  setProxyUrl(e.target.value);
-                  setProxyNeedsRestart(false);
-                }}
-                className="w-[280px]"
-                size="default"
-                disabled={proxyLoading}
-                note={
-                  proxyNeedsRestart
-                    ? t('setting.proxy-restart-hint')
-                    : undefined
-                }
-                trailingButton={
+              <div className="flex w-full flex-col gap-ds-stack-related">
+                <Input
+                  aria-label={t('setting.network-proxy')}
+                  aria-describedby={
+                    proxyNeedsRestart ? proxyRestartHintId : undefined
+                  }
+                  placeholder={t('setting.proxy-placeholder')}
+                  value={proxyUrl}
+                  onChange={(e) => {
+                    setProxyUrl(e.target.value);
+                  }}
+                  size="default"
+                  disabled={proxyLoading || isProxySaving}
+                />
+                {/* Each action keeps its meaning after a save. In particular,
+                    a second Save click must never clear the proxy or restart. */}
+                <div className="flex flex-wrap items-center justify-end gap-ds-control-gap">
                   <Button
-                    variant={proxyNeedsRestart ? 'outline' : 'primary'}
+                    type="button"
+                    variant="outline"
                     size="sm"
                     buttonRadius="full"
-                    onClick={
-                      proxyNeedsRestart
-                        ? () => host?.electronAPI?.restartApp()
-                        : handleSaveProxy
-                    }
+                    onClick={() => {
+                      setProxyUrl(savedProxyUrl);
+                    }}
                     disabled={
-                      proxyLoading || (!proxyNeedsRestart && isProxySaving)
+                      proxyLoading || isProxySaving || !hasProxyValueChanged
+                    }
+                  >
+                    {t('setting.reset')}
+                  </Button>
+                  <Button
+                    type="button"
+                    variant="primary"
+                    size="sm"
+                    buttonRadius="full"
+                    onClick={handleSaveProxy}
+                    disabled={
+                      proxyLoading || isProxySaving || !hasUnsavedProxyChanges
                     }
                   >
                     {proxyLoading
                       ? t('setting.loading')
-                      : proxyNeedsRestart
-                        ? t('setting.restart-to-apply')
-                        : isProxySaving
-                          ? t('setting.saving')
-                          : t('setting.save')}
+                      : isProxySaving
+                        ? t('setting.saving')
+                        : t('setting.save')}
                   </Button>
-                }
-              />
+                </div>
+                {proxyNeedsRestart ? (
+                  <>
+                    <div role="status">
+                      <DsText
+                        as="p"
+                        role="meta"
+                        id={proxyRestartHintId}
+                        className="text-ds-ink-muted-default"
+                      >
+                        {t('setting.proxy-restart-hint')}
+                      </DsText>
+                    </div>
+                    <Button
+                      type="button"
+                      variant="outline"
+                      size="sm"
+                      className="self-end"
+                      onClick={() => host?.electronAPI?.restartApp()}
+                      disabled={
+                        proxyLoading ||
+                        isProxySaving ||
+                        hasProxyValueChanged ||
+                        !host?.electronAPI?.restartApp
+                      }
+                    >
+                      {t('setting.restart-to-apply')}
+                    </Button>
+                  </>
+                ) : null}
+              </div>
             }
           />
         )}
