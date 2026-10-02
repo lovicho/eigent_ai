@@ -30,6 +30,7 @@ import {
 } from '@/store/projectEventStore';
 import { SessionMode } from '@/types/constants';
 import { act, fireEvent, render, screen, within } from '@testing-library/react';
+import i18next from 'i18next';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 const motionPreference = vi.hoisted(() => ({ reduced: false }));
@@ -615,6 +616,59 @@ describe('ChatBox timeline modes', () => {
       '!text-ds-text-meta'
     );
   });
+
+  it.each([
+    [
+      'expired',
+      'approval_expired',
+      i18next.t('chat.approval-expired-description'),
+    ],
+    [
+      'cancelled',
+      'tool_terminal_before_dispatch',
+      i18next.t('chat.approval-tool-ended-description'),
+    ],
+  ] as const)(
+    'shows the recorded %s approval reason in expanded Detailed history',
+    (status, reason, description) => {
+      const { container } = render(
+        <TimelineModeRenderer
+          detailLevel="trajectory"
+          runs={composeTimelineRuns([
+            {
+              ...base,
+              kind: 'interaction',
+              id: 'approval-receipt',
+              eventId: 'approval-receipt',
+              eventType: `interaction.${status}`,
+              runSequence: 1,
+              createdAt: '2026-08-19T00:00:00Z',
+              interactionId: 'approval-1',
+              interactionType: 'approval',
+              prompt: 'Allow this tool?',
+              status,
+              reason,
+            },
+          ])}
+        />
+      );
+      const row = container.querySelector(
+        '[data-trace-category="input-required"]'
+      ) as HTMLElement;
+      const toggle = within(row).getByRole('button');
+      expect(toggle).toHaveAttribute('aria-expanded', 'false');
+      fireEvent.click(toggle);
+      expect(toggle).toHaveAttribute('aria-expanded', 'true');
+      expect(within(row).getByText(description)).toHaveClass(
+        '!text-ds-text-meta',
+        'text-ds-ink-muted-default'
+      );
+      expect(
+        within(row).queryByRole('button', { name: 'Approve once' })
+      ).toBeNull();
+      expect(within(row).queryByText(reason)).toBeNull();
+    }
+  );
 
   it('uses lightly tinted backgrounds with strong text for agent tags', () => {
     const agentNode: ChatProjectionNode = {
@@ -2428,3 +2482,65 @@ describe('ChatBox timeline modes', () => {
     expect(screen.getByText(/Working on tasks for/)).toBeInTheDocument();
   });
 });
+
+it.each(['narrative', 'trajectory'] as const)(
+  'keeps quota presentation safe after event replay and remount in %s',
+  (detailLevel) => {
+    const projectId = 'quota-presentation-replay';
+    const runId = 'quota-run';
+    const raw = {
+      id: 981,
+      task_id: runId,
+      step: 'error',
+      timestamp: 1787000000,
+      data: {
+        message: JSON.stringify({
+          detail: { code: 'trial_daily_exhausted', secret: 'synthetic-secret' },
+        }),
+        request_id: 'diagnostic-request',
+      },
+    };
+    for (const historical of [false, true]) {
+      releaseProjectEventStore(projectId);
+      const store = getProjectEventStore(projectId, {
+        scheduleFlush: () => () => {},
+      });
+      expect(
+        enqueueChatEventProjection(
+          {
+            raw,
+            projectId,
+            runId,
+            sequence: 1,
+            sourceId: 'quota-fixture',
+            transport: 'legacy_chat',
+            historical,
+          },
+          true,
+          true
+        )
+      ).toBe('accepted');
+      store.flushAll();
+      const snapshot = store.getSnapshot();
+      const nodes = selectRenderableChatNodes(snapshot.chat);
+      expect(JSON.stringify(nodes)).toContain('synthetic-secret');
+      const runs = reconcileTimelineRuns(
+        composeTimelineRuns(presentChatSemanticEntities(nodes)),
+        snapshot.view.runs
+      );
+      const view = render(
+        <TimelineModeRenderer detailLevel={detailLevel} runs={runs} />
+      );
+      expect(view.container.textContent).not.toContain('synthetic-secret');
+      expect(view.container.textContent).not.toContain('trial_daily_exhausted');
+      const disclosure = screen.queryByRole('button', { name: /Failed after/ });
+      if (disclosure) fireEvent.click(disclosure);
+      expect(view.container.textContent).toContain(
+        'You’ve used today’s trial credits.'
+      );
+      expect(view.container.textContent).not.toContain('diagnostic-request');
+      view.unmount();
+    }
+    releaseProjectEventStore(projectId);
+  }
+);

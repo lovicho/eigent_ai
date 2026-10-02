@@ -22,6 +22,7 @@ import {
 } from '@/api/http';
 import { isWeb } from '@/client/platform';
 import useChatStoreAdapter from '@/hooks/useChatStoreAdapter';
+import { useHumanInteractionExpiry } from '@/hooks/useHumanInteractionExpiry';
 import { useInterruptedRunStatus } from '@/hooks/useInterruptedRunStatus';
 import { useModelConfigCheck } from '@/hooks/useModelConfigCheck';
 import { useProjectEventRuntime } from '@/hooks/useProjectEventRuntime';
@@ -29,6 +30,10 @@ import { useSessionExecution } from '@/hooks/useSessionExecution';
 import { useUsageIncidentBanner } from '@/hooks/useUsageIncidentBanner';
 import { useHost } from '@/host';
 import { generateUniqueId } from '@/lib';
+import {
+  interruptedRunDescription,
+  isHumanInteractionReadOnly,
+} from '@/lib/approvalPresentation';
 import { getAccountEnvironmentKey } from '@/lib/authEnvironment';
 import { notifyError } from '@/lib/notifyError';
 import {
@@ -44,6 +49,7 @@ import { inferSessionModeFromTask } from '@/lib/sessionMode';
 import { parseSpaceModelReference } from '@/lib/spaceModelReference';
 import { takeControlOfTask } from '@/lib/taskRuntimeControl';
 import { errorCopy } from '@/lib/usageErrors';
+import { buildUsageLimitBannerState } from '@/lib/usageLimitBanner';
 import {
   reconcileControlOperations,
   stopProjectTask,
@@ -57,7 +63,11 @@ import {
   prioritizeFollowUpRequest,
   terminalContinuationAdmissionRejection,
 } from '@/service/followUpQueueApi';
-import { decideHumanInteraction } from '@/service/humanInteractionApi';
+import {
+  decideHumanInteraction,
+  invalidatePendingHumanInteractions,
+  isHumanInteractionStillPending,
+} from '@/service/humanInteractionApi';
 import { completeHumanInteraction } from '@/service/humanInteractionCompletion';
 import { reconcileHumanInteractionEvents } from '@/service/humanInteractionEventReconciliation';
 import { cancelProjectRun } from '@/service/projectRunsApi';
@@ -126,8 +136,6 @@ const CHAT_SCROLL_BOTTOM_MIN_PX = 128;
 /** Small gap between last message and BottomBox top. */
 const CHAT_SCROLL_BOTTOM_GAP_PX = 8;
 
-const USAGE_WARNING_RATIO = 0.75;
-const FREE_STARTING_CREDITS = 500;
 const TERMINAL_QUEUED_RUN_STATUSES = new Set([
   'completed',
   'failed',
@@ -180,144 +188,10 @@ function selectLatestReadOnlyEventNativeRun(
   );
 }
 
-interface SubscriptionLimitInfo {
-  plan_key?: string | null;
-  is_trialing?: boolean | null;
-  monthly_credits?: number | null;
-  trial_daily_credits_limit?: number | null;
-  trial_daily_credits_used?: number | null;
-  trial_daily_credits_remaining?: number | null;
-  trial_total_credits_limit?: number | null;
-  trial_total_credits_used?: number | null;
-  trial_total_credits_remaining?: number | null;
-}
-
-interface UsageLimitBannerState {
-  id: string;
-  message: string;
-  actionLabel: string;
-  severity: 'warning' | 'danger';
-}
-
 function getCurrentTimestamp() {
   return Date.now();
 }
 
-const toFiniteNumber = (value: unknown): number | null =>
-  typeof value === 'number' && Number.isFinite(value) ? value : null;
-
-const usagePercent = (used: number, limit: number) =>
-  Math.min(100, Math.max(0, Math.round((used / limit) * 100)));
-
-const buildUsageLimitBannerState = (
-  subscription: SubscriptionLimitInfo | null,
-  currentCredits: number | null,
-  t: (key: string, options?: Record<string, unknown>) => string
-): UsageLimitBannerState | null => {
-  const actionLabel = t('chat.usage-limit-action');
-
-  if (subscription?.is_trialing) {
-    const trialCandidates = [
-      {
-        id: 'trial-daily',
-        warningKey: 'chat.usage-limit-trial-daily-warning',
-        exhaustedKey: 'chat.notice-trial-daily',
-        limit: toFiniteNumber(subscription.trial_daily_credits_limit),
-        used: toFiniteNumber(subscription.trial_daily_credits_used),
-        remaining: toFiniteNumber(subscription.trial_daily_credits_remaining),
-      },
-      {
-        id: 'trial-total',
-        warningKey: 'chat.usage-limit-trial-total-warning',
-        exhaustedKey: 'chat.notice-trial-total',
-        limit: toFiniteNumber(subscription.trial_total_credits_limit),
-        used: toFiniteNumber(subscription.trial_total_credits_used),
-        remaining: toFiniteNumber(subscription.trial_total_credits_remaining),
-      },
-    ]
-      .map((candidate) => {
-        if (!candidate.limit || candidate.limit <= 0 || candidate.used === null)
-          return null;
-
-        const remaining =
-          candidate.remaining ?? Math.max(candidate.limit - candidate.used, 0);
-        const ratio = candidate.used / candidate.limit;
-        const exhausted = remaining <= 0 || candidate.used >= candidate.limit;
-
-        if (!exhausted && ratio < USAGE_WARNING_RATIO) return null;
-
-        const percent = usagePercent(candidate.used, candidate.limit);
-        return {
-          id: `${candidate.id}:${exhausted ? 'exhausted' : 'warning'}`,
-          message: t(
-            exhausted ? candidate.exhaustedKey : candidate.warningKey,
-            {
-              percent,
-            }
-          ),
-          actionLabel,
-          severity: exhausted ? ('danger' as const) : ('warning' as const),
-          ratio,
-          exhausted,
-        };
-      })
-      .filter(Boolean)
-      .sort((a, b) => {
-        if (a!.exhausted !== b!.exhausted) {
-          return a!.exhausted ? -1 : 1;
-        }
-        return b!.ratio - a!.ratio;
-      });
-
-    if (trialCandidates[0]) {
-      const {
-        ratio: _ratio,
-        exhausted: _exhausted,
-        ...banner
-      } = trialCandidates[0];
-      return banner;
-    }
-  }
-
-  if (currentCredits === null) return null;
-
-  if (currentCredits <= 0) {
-    const planKey = subscription?.plan_key?.toLowerCase() || 'free';
-    return {
-      id: `credits-exhausted:${planKey}`,
-      message: t(
-        planKey === 'free' ? 'chat.notice-free-credits' : 'chat.notice-credits'
-      ),
-      actionLabel,
-      severity: 'danger',
-    };
-  }
-
-  if (!subscription?.plan_key) return null;
-  const planKey = subscription.plan_key.toLowerCase();
-  const limit =
-    planKey === 'free'
-      ? FREE_STARTING_CREDITS
-      : toFiniteNumber(subscription?.monthly_credits);
-
-  if (!limit || limit <= 0) return null;
-
-  const remainingRatio = currentCredits / limit;
-  if (remainingRatio > 1 - USAGE_WARNING_RATIO) return null;
-
-  const percent = usagePercent(limit - currentCredits, limit);
-  return {
-    id: `${planKey === 'free' ? 'free' : 'monthly'}-credits:warning`,
-    message: t(
-      planKey === 'free'
-        ? 'chat.usage-limit-free-warning'
-        : 'chat.usage-limit-monthly-warning',
-      { percent }
-    ),
-    actionLabel,
-    severity: 'warning',
-  };
-};
 export default function ChatBox(): JSX.Element {
   const { projectStore } = useChatStoreAdapter();
   const projectId = projectStore.activeProjectId;
@@ -748,7 +622,76 @@ function LegacyChatBox(): JSX.Element {
       legacyControlView.current.generation++;
     };
   }, []);
+  const legacyInteractionExpired = useHumanInteractionExpiry(activeInteraction);
+  const [verifiedLegacyApproval, setVerifiedLegacyApproval] =
+    useState<string>();
+  useEffect(() => {
+    setVerifiedLegacyApproval(undefined);
+    if (
+      !activeInteraction ||
+      activeInteraction.interaction_type !== 'approval' ||
+      legacyInteractionExpired ||
+      isHumanInteractionReadOnly({
+        interaction: activeInteraction,
+        activeTaskId,
+        taskType: activeAskTask?.type,
+        taskStatus: activeAskTask?.status,
+        durableRunStatus:
+          projectedLegacyRun?.status ?? activeAskTask?.durableRunStatus,
+      })
+    )
+      return;
+    let cancelled = false;
+    let checkNumber = 0;
+    const validatePending = () => {
+      const currentCheck = ++checkNumber;
+      void isHumanInteractionStillPending(activeInteraction)
+        .then((pending) => {
+          if (!cancelled && currentCheck === checkNumber)
+            setVerifiedLegacyApproval(
+              pending ? legacyControlViewKey : undefined
+            );
+        })
+        .catch(() => {
+          /* Keep controls unavailable until a lifecycle recovery retries. */
+        });
+    };
+    const revalidatePending = () => {
+      invalidatePendingHumanInteractions(activeInteraction.run_id);
+      validatePending();
+    };
+    validatePending();
+    window.addEventListener('focus', revalidatePending);
+    host?.ipcRenderer?.on('backend-ready', revalidatePending);
+    return () => {
+      cancelled = true;
+      window.removeEventListener('focus', revalidatePending);
+      host?.ipcRenderer?.off('backend-ready', revalidatePending);
+    };
+  }, [
+    legacyControlViewKey,
+    activeInteraction,
+    activeTaskId,
+    activeAskTask?.type,
+    activeAskTask?.status,
+    activeAskTask?.durableRunStatus,
+    projectedLegacyRun?.status,
+    legacyInteractionExpired,
+    host?.ipcRenderer,
+  ]);
   const isInteractiveHumanReply =
+    (activeInteraction?.interaction_type !== 'approval' ||
+      verifiedLegacyApproval === legacyControlViewKey) &&
+    !legacyInteractionExpired &&
+    (!activeInteraction ||
+      !isHumanInteractionReadOnly({
+        interaction: activeInteraction,
+        activeTaskId,
+        taskType: activeAskTask?.type,
+        taskStatus: activeAskTask?.status,
+        durableRunStatus:
+          projectedLegacyRun?.status ?? activeAskTask?.durableRunStatus,
+      })) &&
     !!activeAskTask &&
     activeAskTask.type !== 'replay' &&
     activeAskTask.type !== 'share' &&
@@ -770,7 +713,8 @@ function LegacyChatBox(): JSX.Element {
       !interaction ||
       interaction.interaction_type !== 'approval' ||
       !taskId ||
-      legacyApprovalSubmitting
+      legacyApprovalSubmitting ||
+      !isInteractiveHumanReply
     ) {
       return;
     }
@@ -787,6 +731,34 @@ function LegacyChatBox(): JSX.Element {
         .activeTaskId === taskId;
     setLegacyApprovalSubmitting(true);
     try {
+      invalidatePendingHumanInteractions(interaction.run_id);
+      const isPending = await isHumanInteractionStillPending(interaction);
+      if (!isCurrent()) return;
+      if (!isPending) {
+        setVerifiedLegacyApproval(undefined);
+        await refreshInterruptedRun();
+        return;
+      }
+      const currentTask = projectStore.getActiveChatStore()?.getState().tasks[
+        taskId
+      ];
+      if (
+        !currentTask ||
+        isHumanInteractionReadOnly({
+          interaction:
+            currentTask.messages.findLast(
+              (message) =>
+                message.interaction?.interaction_id ===
+                interaction.interaction_id
+            )?.interaction || interaction,
+          activeTaskId: projectStore.getActiveChatStore()?.getState()
+            .activeTaskId,
+          taskType: currentTask.type,
+          taskStatus: currentTask.status,
+          durableRunStatus: currentTask.durableRunStatus,
+        })
+      )
+        return;
       await decideHumanInteraction(interaction, {
         decisionRequestId: generateUniqueId(),
         decision: { decision, scope },
@@ -1027,10 +999,7 @@ function LegacyChatBox(): JSX.Element {
       // Check model configuration before starting task
       if (!hasModel) {
         if (isCloudUsageLimited) {
-          notifyError(
-            cloudUsageLimitMessage ||
-              t('chat.usage-limit-trial-daily-exhausted')
-          );
+          notifyError(cloudUsageLimitMessage || errorCopy('credits'));
           return;
         }
         notifyError(
@@ -1146,9 +1115,7 @@ function LegacyChatBox(): JSX.Element {
     );
     if ((isCloudUsageLimited && !replyingToHuman) || !canUseSessionModel) {
       if (isCloudUsageLimited) {
-        notifyError(
-          cloudUsageLimitMessage || t('chat.usage-limit-trial-daily-exhausted')
-        );
+        notifyError(cloudUsageLimitMessage || errorCopy('credits'));
         return;
       }
       notifyError(
@@ -1301,7 +1268,11 @@ function LegacyChatBox(): JSX.Element {
         });
       } catch (error: any) {
         console.error('[FollowUpQueue] Failed to persist message', error);
-        notifyError(error?.message || 'Failed to queue message.');
+        notifyError(
+          error instanceof Error
+            ? error
+            : error?.message || 'Failed to queue message.'
+        );
         return;
       }
       projectStore.restoreQueuedMessage(targetProjectId, {
@@ -1495,7 +1466,11 @@ function LegacyChatBox(): JSX.Element {
           chatStore.removeMessage(_taskId, humanReplyMessageId);
           chatStore.setIsPending(_taskId, false);
           setMessage(tempMessageContent);
-          notifyError(error?.message || 'Failed to send your reply.');
+          notifyError(
+            error instanceof Error
+              ? error
+              : error?.message || 'Failed to send your reply.'
+          );
           return;
         }
         if (replyResult?.code === 1) {
@@ -1794,7 +1769,11 @@ function LegacyChatBox(): JSX.Element {
                     error?.message ||
                     '❌ **Error**: Failed to start the follow-up task.',
                 });
-                notifyError(error?.message || 'Failed to send follow-up.');
+                notifyError(
+                  error instanceof Error
+                    ? error
+                    : error?.message || 'Failed to send follow-up.'
+                );
                 if (preserveComposer) throw error;
               }
             }
@@ -1840,8 +1819,10 @@ function LegacyChatBox(): JSX.Element {
           } catch (err: any) {
             console.error('Failed to start task:', err);
             notifyError(
-              err?.message ||
-                'Failed to start task. Please check your model configuration.'
+              err instanceof Error
+                ? err
+                : err?.message ||
+                    'Failed to start task. Please check your model configuration.'
             );
             if (preserveComposer) throw err;
             return;
@@ -1889,9 +1870,7 @@ function LegacyChatBox(): JSX.Element {
     // Unpinned recovery must establish the canonical model category first.
     // startTask applies the quota check to that recovered model before admission.
     if (isCloudUsageLimited && !canAttemptModelRecovery) {
-      notifyError(
-        cloudUsageLimitMessage || t('chat.usage-limit-trial-daily-exhausted')
-      );
+      notifyError(cloudUsageLimitMessage || errorCopy('credits'));
       return;
     }
     if (!canUseSessionModel && !canAttemptModelRecovery) {
@@ -1939,7 +1918,11 @@ function LegacyChatBox(): JSX.Element {
     } catch (error: any) {
       console.error('[RunControl] Failed to resume Run', error);
       finishResumeRequest(owner, requestId, false);
-      notifyError(error?.message || t('chat.run-resume-failed'));
+      notifyError(
+        error instanceof Error
+          ? error
+          : error?.message || t('chat.run-resume-failed')
+      );
       await refreshInterruptedRun(owner.accountKey);
     } finally {
       setDurableRunAction(null);
@@ -2235,7 +2218,11 @@ function LegacyChatBox(): JSX.Element {
           return;
         }
         projectStore.setQueuedMessageProcessing(projectId, next.task_id, false);
-        notifyError(error?.message || 'Failed to send queued message.');
+        notifyError(
+          error instanceof Error
+            ? error
+            : error?.message || 'Failed to send queued message.'
+        );
       })
       .finally(() => {
         queuedDispatchRef.current = null;
@@ -2668,7 +2655,8 @@ function LegacyChatBox(): JSX.Element {
         ),
         description: isCloudRestoredRun
           ? undefined
-          : (cancelRecoveryReason ?? t('chat.run-interrupted-description')),
+          : (cancelRecoveryReason ??
+            interruptedRunDescription(interruptedRun.terminalReason, t)),
       },
       runId: interruptedRun.run_id,
       state: isCloudRestoredRun
@@ -2846,11 +2834,14 @@ function LegacyChatBox(): JSX.Element {
                       ? 'chat.run-cloud-restored-title'
                       : 'chat.run-interrupted-title'
                   )}
-                  description={t(
+                  description={
                     isCloudRestoredRun
-                      ? 'chat.run-cloud-restored-description'
-                      : 'chat.run-interrupted-description'
-                  )}
+                      ? t('chat.run-cloud-restored-description')
+                      : interruptedRunDescription(
+                          interruptedRun.terminalReason,
+                          t
+                        )
+                  }
                   disabledReason={cancelRecoveryReason}
                   action={durableRunAction}
                   resumeLabel={t('chat.run-resume')}
@@ -2944,11 +2935,14 @@ function LegacyChatBox(): JSX.Element {
                       ? 'chat.run-cloud-restored-title'
                       : 'chat.run-interrupted-title'
                   )}
-                  description={t(
+                  description={
                     isCloudRestoredRun
-                      ? 'chat.run-cloud-restored-description'
-                      : 'chat.run-interrupted-description'
-                  )}
+                      ? t('chat.run-cloud-restored-description')
+                      : interruptedRunDescription(
+                          interruptedRun.terminalReason,
+                          t
+                        )
+                  }
                   attemptNumber={interruptedRun.latest_attempt?.attempt_number}
                   disabledReason={cancelRecoveryReason}
                   action={durableRunAction}
