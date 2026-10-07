@@ -12,6 +12,7 @@
 // limitations under the License.
 // ========= Copyright 2025-2026 @ Eigent.ai All Rights Reserved. =========
 
+import { isRelayedEventStreamResponse } from '@/api/brainStreamRelay';
 import {
   fetchDelete,
   fetchGet,
@@ -43,7 +44,10 @@ import {
   recordTaskStopped,
   recordTaskSubmitted,
 } from '@/lib/events/appEvents';
-import { notifyDurableRunStatusChanged } from '@/lib/events/durableRunEvents';
+import {
+  notifyDurableRunStatusChanged,
+  notifyRunStreamReopened,
+} from '@/lib/events/durableRunEvents';
 import { createLocalError } from '@/lib/localError';
 import {
   resolveSourceEventId,
@@ -51,6 +55,7 @@ import {
 } from '@/lib/messageIdentity';
 import { buildAgentModelConfigFromProvider } from '@/lib/modelConfig';
 import { reportError } from '@/lib/notifyError';
+import { isTerminalHumanControlEvent } from '@/lib/projector/control/adapter';
 import { isStoppedRunStatus } from '@/lib/projector/runSummary';
 import {
   normalizeRemoteSubAgentProvider,
@@ -140,15 +145,37 @@ const PROJECT_CONTEXT_MAX_RUNS = 8;
 // end step.
 const MAX_CHAT_HISTORY_SUMMARY_LENGTH = 1024;
 
+/** Resume admission refuses to replay a write whose outcome is unknown. */
+function isUnsafeResumeBlocked(error: unknown): boolean {
+  const failure = error as {
+    status?: unknown;
+    response?: { data?: { detail?: { code?: unknown } } };
+  } | null;
+  return (
+    failure?.status === 409 &&
+    failure.response?.data?.detail?.code === 'unsafe_resume_blocked'
+  );
+}
+
 export async function admitDurableRunResume(
   runId: string,
   requestId: string,
   post: typeof fetchPost = fetchPost
 ): Promise<number> {
-  const response = await post(`/runs/${encodeURIComponent(runId)}/resume`, {
-    request_id: requestId,
-    reason: 'explicit_resume',
-  });
+  let response;
+  try {
+    response = await post(`/runs/${encodeURIComponent(runId)}/resume`, {
+      request_id: requestId,
+      reason: 'explicit_resume',
+    });
+  } catch (error) {
+    // Retrying cannot help; explain the refusal instead of a generic failure.
+    throw isUnsafeResumeBlocked(error)
+      ? createLocalError(i18next.t('chat.run-resume-unsafe-blocked'), {
+          cause: error,
+        })
+      : error;
+  }
   const attemptNumber = response?.attempt?.attempt_number;
   if (!Number.isSafeInteger(attemptNumber) || attemptNumber < 1) {
     throw new Error(
@@ -179,22 +206,27 @@ export const canonicalRunEventToLegacyMessage = (
     payload?: unknown;
     created_at?: unknown;
   };
-  // Approval decisions are canonical-only events. Project their durable
+  // Interaction outcomes are canonical-only events: a decision, a system
+  // cancellation (for example at restart) or an expiry. Project the durable
   // interaction id into the legacy reducer so reconnect/replay closes the
-  // corresponding ASK card instead of resurrecting an already-decided card.
+  // corresponding ASK card instead of resurrecting it or queueing the next
+  // request (such as the one asked again after Resume) behind it.
   if (
-    event.event_type === 'approval.decided' ||
-    event.event_type === 'interaction.resolved'
+    typeof event.event_type === 'string' &&
+    isTerminalHumanControlEvent(event.event_type)
   ) {
     const payload =
       event.payload && typeof event.payload === 'object'
         ? (event.payload as Record<string, unknown>)
         : null;
-    if (typeof payload?.interaction_id !== 'string') return null;
+    // An approval expiry identifies its request by approval id only.
+    const interactionId = payload?.interaction_id ?? payload?.approval_id;
+    if (typeof interactionId !== 'string' || !interactionId) return null;
     return {
       step: AgentStep.HUMAN_REPLY,
       data: {
         ...payload,
+        interaction_id: interactionId,
         __durable_interaction_resolution: true,
       },
       timestamp:
@@ -800,7 +832,8 @@ interface Task {
   source: 'user' | 'trigger';
   sessionMode?: SessionModeType;
   messages: Message[];
-  type: string;
+  /** Playback kind such as `replay` or `share`; absent for a live task. */
+  type?: string;
   summaryTask: string;
   taskInfo: TaskInfo[];
   attaches: File[];
@@ -1297,6 +1330,12 @@ export interface ChatStore {
     taskId: string,
     status: DurableRunDisplayStatus | undefined
   ) => void;
+  /**
+   * Resume admitted a new Attempt for this task's Run. Drop the playback
+   * identity, interrupted outcome and waiters restored from history so the
+   * new Attempt's requests are live. Retired receipts stay read-only.
+   */
+  markRunResumed: (taskId: string) => void;
   setActiveTaskId: (taskId: string) => void;
   setTaskSessionMode: (taskId: string, mode: SessionModeType) => void;
   replay: (
@@ -1436,6 +1475,8 @@ type ActiveSSEConnection = {
   taskId: string;
   recoverClosedUsage?: () => void;
   displayTail?: { taskId: string; promise: Promise<void>; release: () => void };
+  /** Opened through the main-process relay: it holds no renderer connection. */
+  relayed?: boolean;
 };
 
 const activeSSEControllers: Record<string, ActiveSSEConnection> = {};
@@ -1586,6 +1627,20 @@ function markSSEConnectionIdleForTask(
     const timer = setTimeout(tail.release, 5_000);
     connection.displayTail = tail;
   }
+}
+
+/**
+ * A Run that finishes while its Session is in the background has nothing more
+ * to render on its idle stream. Release it now instead of at the next Session
+ * switch, so finished background Runs do not hold the renderer's connections.
+ */
+function reclaimIdleStreamInBackground(projectId: string): void {
+  const projectState = useProjectStore.getState();
+  if (projectState.activeProjectId === projectId) return;
+  // Partial Project store doubles may omit this action.
+  projectState.reclaimIdleStreams?.(projectState.activeProjectId ?? null, [
+    projectId,
+  ]);
 }
 
 function cleanupTaskSSEResources(
@@ -3743,6 +3798,10 @@ const chatStore = (initial?: Partial<ChatStore>) =>
           finishStartupFailure();
           throw error;
         }
+        // The admitted Attempt continues this Run in the same task, which may
+        // still be the playback restored at startup. Only now that the Run is
+        // no longer interrupted is that history state retired.
+        targetChatStore.getState().markRunResumed(newTaskId);
       }
 
       // Lock the chatStore reference at the start of SSE session to prevent focus changes
@@ -3936,6 +3995,7 @@ const chatStore = (initial?: Partial<ChatStore>) =>
             // ownership, in which case the guarded idle transition is a
             // no-op but this terminal observer is still finished.
             binding.dispose();
+            reclaimIdleStreamInBackground(project_id);
           } else {
             binding.dispose();
             cleanupSSEConnection(sseConnection);
@@ -4305,6 +4365,69 @@ const chatStore = (initial?: Partial<ChatStore>) =>
         AgentStep.NOTICE,
       ]);
       let legacyEndRunId: string | null = null;
+
+      // Admission failed before the event stream existed. Unlike an execution
+      // error, no later END frame can clear the optimistic pending state, so
+      // close it here and surface the typed Brain reason instead of leaving
+      // the composer stuck on "Preparing".
+      const failAdmission = (err: any) => {
+        if (
+          err?.code === 'project_consumer_active' &&
+          createdTriggerBinding &&
+          !startOptions.resumeRequestId &&
+          triggerExecutionId &&
+          project_id
+        ) {
+          forgetRejectedTriggerRun(triggerExecutionId, project_id, newTaskId);
+        }
+        finishStartupFailure();
+        const failureState = targetChatStore.getState();
+        const failureTask = failureState.tasks[newTaskId];
+        const userMessage =
+          typeof err?.userMessage === 'string' && err.userMessage.trim()
+            ? err.userMessage.trim()
+            : typeof err?.message === 'string' && err.message.trim()
+              ? err.message.trim()
+              : i18next.t('chat.task-admission-failed', {
+                  defaultValue:
+                    'The task could not be started. Please try again.',
+                });
+        const isContinuationClarification =
+          typeof err?.code === 'string' && err.code.startsWith('continuation_');
+        const content = isContinuationClarification
+          ? i18next.t('chat.control-input-required-message', {
+              defaultValue: 'Input required: {{message}}',
+              message: userMessage,
+            })
+          : i18next.t('chat.error-message', {
+              defaultValue: '❌ **Error**: {{message}}',
+              message: userMessage,
+            });
+        const alreadyRendered = failureTask?.messages.some(
+          (message) => message.role === 'agent' && message.content === content
+        );
+        if (failureTask && !alreadyRendered) {
+          failureState.addMessages(newTaskId, {
+            id: generateUniqueId(),
+            role: 'agent',
+            content,
+            ...(!isContinuationClarification
+              ? {
+                  step: AgentStep.ERROR,
+                  errorReason: reportError(
+                    err,
+                    {
+                      modelType: effectiveModelType,
+                      modelId: resolvedCloudModelId,
+                      executionId,
+                    },
+                    requestAccount
+                  ),
+                }
+              : {}),
+          });
+        }
+      };
 
       const guardDelivery =
         adoptingSpaceDefault || startOptions.resumeRequestId;
@@ -6707,6 +6830,7 @@ const chatStore = (initial?: Partial<ChatStore>) =>
             // await below. A following NEW_TASK_STATE can then reactivate and
             // transfer ownership without a resumed END handler undoing it.
             markSSEConnectionIdleForTask(sseConnection, currentTaskId);
+            if (!type && project_id) reclaimIdleStreamInBackground(project_id);
 
             // Finish the local UI projection before any cloud upload or
             // history request. Camel-log and generated-file uploads can take
@@ -7173,11 +7297,23 @@ const chatStore = (initial?: Partial<ChatStore>) =>
               modelType: effectiveModelType,
               modelId: resolvedCloudModelId,
             });
+            // An awaited admission settles on this rejection and aborts the
+            // transport, which then never reaches onerror. Settle the new task
+            // here so it keeps its error receipt. A Resume keeps its
+            // interrupted task, whose controls ChatBox restores.
+            if (startOptions.awaitAdmission && !startOptions.resumeRequestId)
+              failAdmission(error);
             rejectResumeStreamOpen?.(error);
             throw error;
           }
+          // A reconnect may fall back to the window's own fetch.
+          sseConnection.relayed = isRelayedEventStreamResponse(respond);
           const firstOpen = !resumeStreamOpened;
-          if (resumeStreamOpened) reconcileStreamRun();
+          if (resumeStreamOpened) {
+            reconcileStreamRun();
+            // Let waiting cards re-check Brain now instead of at their backoff.
+            notifyRunStreamReopened(lockedTaskId);
+          }
           if (commitSpaceModelPin) {
             try {
               commitSpaceModelPin();
@@ -7250,75 +7386,9 @@ const chatStore = (initial?: Partial<ChatStore>) =>
             return;
           }
 
-          if (!resumeStreamOpened) rejectResumeStreamOpen?.(err);
-
           if (!resumeStreamOpened) {
-            if (
-              err?.code === 'project_consumer_active' &&
-              createdTriggerBinding &&
-              !startOptions.resumeRequestId &&
-              triggerExecutionId &&
-              project_id
-            ) {
-              forgetRejectedTriggerRun(
-                triggerExecutionId,
-                project_id,
-                newTaskId
-              );
-            }
-            // Admission failed before the event stream existed. Unlike an
-            // execution error, no later END frame can clear the optimistic
-            // pending state, so close it here and surface the typed Brain
-            // reason instead of leaving the composer stuck on "Preparing".
-            finishStartupFailure();
-            const failureState = targetChatStore.getState();
-            const failureTask = failureState.tasks[newTaskId];
-            const userMessage =
-              typeof err?.userMessage === 'string' && err.userMessage.trim()
-                ? err.userMessage.trim()
-                : typeof err?.message === 'string' && err.message.trim()
-                  ? err.message.trim()
-                  : i18next.t('chat.task-admission-failed', {
-                      defaultValue:
-                        'The task could not be started. Please try again.',
-                    });
-            const isContinuationClarification =
-              typeof err?.code === 'string' &&
-              err.code.startsWith('continuation_');
-            const content = isContinuationClarification
-              ? i18next.t('chat.control-input-required-message', {
-                  defaultValue: 'Input required: {{message}}',
-                  message: userMessage,
-                })
-              : i18next.t('chat.error-message', {
-                  defaultValue: '❌ **Error**: {{message}}',
-                  message: userMessage,
-                });
-            const alreadyRendered = failureTask?.messages.some(
-              (message) =>
-                message.role === 'agent' && message.content === content
-            );
-            if (failureTask && !alreadyRendered) {
-              failureState.addMessages(newTaskId, {
-                id: generateUniqueId(),
-                role: 'agent',
-                content,
-                ...(!isContinuationClarification
-                  ? {
-                      step: AgentStep.ERROR,
-                      errorReason: reportError(
-                        err,
-                        {
-                          modelType: effectiveModelType,
-                          modelId: resolvedCloudModelId,
-                          executionId,
-                        },
-                        requestAccount
-                      ),
-                    }
-                  : {}),
-              });
-            }
+            rejectResumeStreamOpen?.(err);
+            failAdmission(err);
           }
 
           // A transport error does not establish a cancelled execution outcome.
@@ -7934,6 +8004,25 @@ const chatStore = (initial?: Partial<ChatStore>) =>
               durableRunStatus,
               messages: task.messages.map(retireApproval),
               askList: task.askList.map(retireApproval),
+            },
+          },
+        };
+      });
+    },
+    markRunResumed(taskId: string) {
+      set((state) => {
+        const task = state.tasks[taskId];
+        if (!task) return state;
+        return {
+          ...state,
+          tasks: {
+            ...state.tasks,
+            [taskId]: {
+              ...task,
+              type: undefined,
+              durableRunStatus: undefined,
+              activeAsk: '',
+              askList: [],
             },
           },
         };
@@ -8698,9 +8787,29 @@ export function hasActiveSSEConnection(taskIds: string[]): boolean {
   );
 }
 
+type IdleStreamReclaimOptions = {
+  /** Leave relayed transports open; they hold no renderer connection. */
+  keepRelayed?: boolean;
+};
+
 /** Returns true if any task still owns a physical SSE transport. */
-export function hasSSETransportForTasks(taskIds: string[]): boolean {
-  return taskIds.some((taskId) => !!activeSSEControllers[taskId]);
+export function hasSSETransportForTasks(
+  taskIds: string[],
+  { keepRelayed = false }: IdleStreamReclaimOptions = {}
+): boolean {
+  return taskIds.some((taskId) => {
+    const connection = activeSSEControllers[taskId];
+    return !!connection && !(keepRelayed && connection.relayed);
+  });
+}
+
+/** Idle relayed transports, each physical connection counted once. */
+export function countIdleRelayedSSEConnections(): number {
+  return new Set(
+    Object.values(activeSSEControllers).filter(
+      (connection) => connection.relayed && !connection.logicalActive
+    )
+  ).size;
 }
 
 /** Return the Run id that owns an idle reusable legacy `/chat` transport. */
@@ -8738,10 +8847,18 @@ export function closeSSEConnectionsForTasks(taskIds: string[]): void {
 }
 
 /** Close only reusable transports that no longer have a logically active Run. */
-export function closeIdleSSEConnectionsForTasks(taskIds: string[]): void {
+export function closeIdleSSEConnectionsForTasks(
+  taskIds: string[],
+  { keepRelayed = false }: IdleStreamReclaimOptions = {}
+): void {
   for (const taskId of taskIds) {
     const connection = activeSSEControllers[taskId];
-    if (connection && !connection.logicalActive && !connection.displayTail) {
+    if (
+      connection &&
+      !connection.logicalActive &&
+      !connection.displayTail &&
+      !(keepRelayed && connection.relayed)
+    ) {
       console.log(
         '[closeIdleSSEConnectionsForTasks] Closing idle SSE for task:',
         taskId
