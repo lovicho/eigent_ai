@@ -64,6 +64,10 @@ from app.run_journal import (
     configured_run_journal_path,
     get_default_run_journal,
 )
+from app.run_journal.transitions import (
+    RUN_TERMINAL_STATES,
+    RUN_UNSUCCESSFUL_STATES,
+)
 from app.run_runtime import RunCoordinator, get_default_run_coordinator
 from app.run_runtime.admission import (
     WarmRunAdmission,
@@ -82,6 +86,7 @@ from app.service.task import (
     ActionSupplementData,
     ImprovePayload,
     TaskLock,
+    commit_and_deliver,
     delete_task_lock,
     get_or_create_task_lock,
     get_task_lock,
@@ -756,7 +761,7 @@ async def _resolve_continuation_admission(
     next_action = frontier.get("next_action")
     remaining = frontier.get("remaining")
     retry_failed_run = False
-    if latest is not None and latest.status == "failed":
+    if latest is not None and latest.status in RUN_UNSUCCESSFUL_STATES:
         blocked_by = frontier.get("blocked_by")
         if (
             latest_has_unknown_tool_outcome
@@ -2065,7 +2070,7 @@ async def retire_idle_runtime(project_id: str, data: RetireIdleRuntimeRequest):
         )
         if run is None or run.project_id != project_id:
             raise HTTPException(status_code=404, detail="Run not found.")
-        if run.status not in {"completed", "failed", "cancelled"}:
+        if run.status not in RUN_TERMINAL_STATES:
             raise HTTPException(
                 status_code=409,
                 detail="The Run has not reached a terminal state.",
@@ -2780,6 +2785,18 @@ async def human_reply(id: str, data: HumanReply, request: Request):
             code.error,
             "This task is no longer waiting for a human reply. Please send a new message.",
         )
+
+    async def answer_waiter() -> bool:
+        try:
+            await task_lock.put_human_input(data.agent, data.reply)
+        except KeyError:
+            chat_logger.warning(
+                "Human reply target is no longer waiting for input",
+                extra={"task_id": id, "agent": data.agent},
+            )
+            return False
+        return True
+
     run_context = getattr(task_lock, "run_context", None)
     resolved_interaction_id: str | None = None
     if isinstance(run_context, RunContext):
@@ -2890,7 +2907,8 @@ async def human_reply(id: str, data: HumanReply, request: Request):
                 )
             )
             try:
-                _, decision_applied = await asyncio.to_thread(
+                _, decision_applied, delivered = await commit_and_deliver(
+                    answer_waiter,
                     journal.resolve_human_interaction,
                     interaction.interaction_id,
                     include_transition=True,
@@ -2925,17 +2943,13 @@ async def human_reply(id: str, data: HumanReply, request: Request):
                 chat_logger.exception(
                     "Failed to wake cloud sync after HumanInteraction decision"
                 )
-    try:
-        await task_lock.put_human_input(data.agent, data.reply)
-    except KeyError as exc:
-        chat_logger.warning(
-            "Human reply target is no longer waiting for input",
-            extra={"task_id": id, "agent": data.agent},
-        )
+    else:
+        delivered = await answer_waiter()
+    if not delivered:
         raise UserException(
             code.error,
             "This task is no longer waiting for a human reply. Please send a new message.",
-        ) from exc
+        )
 
     reply_payload = {"agent": data.agent, "reply": data.reply}
     if resolved_interaction_id is not None:
