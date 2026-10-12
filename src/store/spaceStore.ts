@@ -17,6 +17,7 @@ import {
   getAccountEnvironmentKey,
   getAuthEnvironmentKey,
 } from '@/lib/authEnvironment';
+import { parseServerTimestamp } from '@/lib/serverTimestamp';
 import {
   getSessionNavLeadFromHistoryProject,
   type SessionNavLeadPresentation,
@@ -26,6 +27,7 @@ import {
   isLocalWorkspaceSpace,
   isPlaceholderProjectName,
   isPlaceholderSpaceNameStatic,
+  sessionHistoryDisplayName,
 } from '@/lib/spaceLabel';
 import { scheduleWorkspaceUnbind } from '@/lib/workspaceUnbind';
 import { fetchGroupedHistoryProjects } from '@/service/historyApi';
@@ -282,8 +284,7 @@ export const legacySpaceIdForUser = (userId?: string | number | null) =>
   `legacy_${canonicalUserId(userId)}`;
 
 const timestampFromServer = (value?: string | null, fallback = Date.now()) => {
-  if (!value) return fallback;
-  const timestamp = new Date(value).getTime();
+  const timestamp = parseServerTimestamp(value);
   return Number.isFinite(timestamp) ? timestamp : fallback;
 };
 
@@ -317,21 +318,10 @@ const isAutoCreatedProjectMeta = (project: SpaceProjectMeta) =>
       normalizedProjectName(project.description) === 'auto-created project'));
 
 const projectMetaWithDisplayName = (project: SpaceProjectMeta) => {
-  const historyDisplayName =
-    typeof project.metadata?.historyDisplayName === 'string'
-      ? project.metadata.historyDisplayName.trim()
-      : '';
-  if (
-    historyDisplayName &&
-    !project.metadata?.nameSource &&
-    isPlaceholderProjectName(project.name, project.id)
-  ) {
-    return {
-      ...project,
-      name: historyDisplayName,
-    };
-  }
-  return project;
+  const historyDisplayName = sessionHistoryDisplayName(project);
+  return historyDisplayName
+    ? { ...project, name: historyDisplayName }
+    : project;
 };
 
 export const getVisibleProjectMetasForSpace = (
